@@ -3,6 +3,7 @@ import datetime as dt
 import os
 import sqlite3
 import time
+from zoneinfo import ZoneInfo
 import requests
 
 BASE = "https://statsapi.mlb.com/api/v1"
@@ -14,7 +15,7 @@ if not WEBHOOK:
     raise SystemExit("Missing DISCORD_WEBHOOK_URL environment variable.")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "MLB-Walk-Discord-Tracker/1.0"})
+session.headers.update({"User-Agent": "MLB-Walk-Discord-Tracker/1.1"})
 
 def get_json(url, params=None):
     r = session.get(url, params=params, timeout=20)
@@ -69,13 +70,13 @@ def post_discord(content):
     )
     r.raise_for_status()
 
-def count_today(con, today):
+def count_today(con, game_date):
     return con.execute(
         "SELECT COUNT(*) FROM walks WHERE game_date = ?",
-        (today,),
+        (game_date,),
     ).fetchone()[0]
 
-def process_game(con, game, today):
+def process_game(con, game, game_date):
     pbp = get_json(f"{BASE}/game/{game['gamePk']}/playByPlay")
 
     for play in pbp.get("allPlays", []):
@@ -91,7 +92,7 @@ def process_game(con, game, today):
         row = {
             "event_key": key,
             "game_pk": game["gamePk"],
-            "game_date": today,
+            "game_date": game_date,
             "batter": matchup.get("batter", {}).get("fullName", "Unknown"),
             "pitcher": matchup.get("pitcher", {}).get("fullName", "Unknown"),
             "inning": about.get("inning"),
@@ -113,7 +114,7 @@ def process_game(con, game, today):
         con.commit()
 
         if cur.rowcount:
-            total = count_today(con, today)
+            total = count_today(con, game_date)
             half = "Top" if row["half"] == "top" else "Bottom"
             intentional = " (IBB)" if "intent" in (row["event"] or "").lower() else ""
             score = ""
@@ -138,29 +139,42 @@ def process_game(con, game, today):
 
 def main():
     con = init_db()
+    eastern = ZoneInfo("America/New_York")
     current_date = None
 
     while True:
         try:
-            today = dt.datetime.now().astimezone().date().isoformat()
+            now_et = dt.datetime.now(eastern)
+            today_et = now_et.date()
+            yesterday_et = today_et - dt.timedelta(days=1)
+
+            today = today_et.isoformat()
+            yesterday = yesterday_et.isoformat()
 
             if today != current_date:
                 current_date = today
-                print(f"Tracking all MLB walks for {today}", flush=True)
+                print(f"Tracking MLB games using Eastern date: {today}", flush=True)
 
-            games = schedule_for(today)
+            # Check both today's and yesterday's MLB slates so late games
+            # remain tracked after midnight Eastern.
+            games = schedule_for(today) + schedule_for(yesterday)
 
+            seen_game_pks = set()
             for game in games:
+                game_pk = game["gamePk"]
+                if game_pk in seen_game_pks:
+                    continue
+                seen_game_pks.add(game_pk)
+
                 state = game.get("status", {}).get("detailedState", "")
                 if state in {
                     "In Progress",
                     "Manager Challenge",
                     "Review",
                     "Delayed",
-                    "Final",
-                    "Game Over",
                 }:
-                    process_game(con, game, today)
+                    game_date = (game.get("gameDate") or today)[:10]
+                    process_game(con, game, game_date)
 
         except Exception as exc:
             print(f"Temporary error: {exc}", flush=True)
